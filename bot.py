@@ -1,6 +1,5 @@
 import asyncio
 import re
-import json
 import time  # Добавлен импорт для работы с временем
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -9,7 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from config import TOKEN, ADMIN_ID, GROUP_ID
-from functions import load_users, save_users, load_blacklist, save_blacklist, parse_time, format_time, get_user_id_by_username_in_group
+from functions import load_users, save_users, load_blacklist, save_blacklist, parse_time, format_time, get_user_id_by_username_in_group, init_db
 from keyboards import cmd_start_kb, cmds_kb
 from FSM import Ban, Unban, Mute, Unmute
 
@@ -17,34 +16,36 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 
-# Фоновая задача для проверки и удаления истекших банов
+# Фоновая задача для проверки и удаления истекших банов (обновлена на асинхронные функции)
 async def check_expired_bans():
     while True:
-        await asyncio.sleep(60)  # Проверяем каждые 60 секунд
-        blacklist = load_blacklist()
-        current_time = int(time.time())
-        to_remove = []
-        for uname, data in blacklist.items():
-            if data.get("until", 0) > 0 and data["until"] < current_time:
-                to_remove.append(uname)
-                user_id = data["id"]
-                # Отправляем сообщение в чат
-                try:
-                    await bot.send_message(chat_id=GROUP_ID, text=f"Пользователь @{uname} разбанен (бан истек).")
-                except Exception as e:
-                    print(f"Ошибка отправки в чат для @{uname}: {e}")
-                # Отправляем личное сообщение пользователю
-                try:
-                    await bot.send_message(chat_id=user_id, text="Ваш бан истек, вы разбанены.")
-                except Exception as e:
-                    print(f"Не удалось отправить личное сообщение пользователю {user_id}: {e}")
-        if to_remove:
-            for uname in to_remove:
-                del blacklist[uname]
-            save_blacklist(blacklist)
-            print(f"Удалены истекшие баны: {to_remove}")
-
-
+        try:
+            await asyncio.sleep(60)  # Проверяем каждые 60 секунд
+            blacklist = await load_blacklist()
+            current_time = int(time.time())
+            to_remove = []
+            for uname, data in blacklist.items():
+                if data.get("until", 0) > 0 and data["until"] < current_time:
+                    to_remove.append(uname)
+                    user_id = data["id"]
+                    # Отправляем сообщение в чат
+                    try:
+                        await bot.send_message(chat_id=GROUP_ID, text=f"Пользователь @{uname} разбанен (бан истек).")
+                    except Exception as e:
+                        print(f"Ошибка отправки в чат для @{uname}: {e}")
+                    # Отправляем личное сообщение пользователю
+                    try:
+                        await bot.send_message(chat_id=user_id, text="Ваш бан истек, вы разбанены.")
+                    except Exception as e:
+                        print(f"Не удалось отправить личное сообщение пользователю {user_id}: {e}")
+            if to_remove:
+                for uname in to_remove:
+                    del blacklist[uname]
+                await save_blacklist(blacklist)
+                print(f"Удалены истекшие баны: {to_remove}")
+        except Exception as e:
+            print(f"Ошибка в check_expired_bans: {e}")
+            await asyncio.sleep(60)  # Ждем перед следующей попыткой
 
 # Обновленная функция для бана по ID или username с временем и причиной
 async def ban_user_by_id_or_username(identifier: str, until_date: int = 0, reason: str = "") -> str:
@@ -62,19 +63,19 @@ async def ban_user_by_id_or_username(identifier: str, until_date: int = 0, reaso
         if identifier.isdigit():  # Если это ID (число)
             user_id = int(identifier)
             print(f"Баним по ID: {user_id}")
-            # Для черного списка попробуем найти username по ID (если есть в users.json)
-            users = load_users()
-            for uname, uid in users.items():
-                if uid == user_id:
+            # Для черного списка попробуем найти username по ID (если есть в базе данных)
+            users = await load_users()
+            for uname, data in users.items():
+                if data.get("id") == user_id:
                     username_for_blacklist = uname
                     break
         elif identifier.startswith('@'):  # Если @username
             username = identifier[1:]  # Убираем '@'
             print(f"Получаем ID по username: {username}")
-            user_id = get_user_id_by_username_in_group(username)  # Из JSON
+            user_id = await get_user_id_by_username_in_group(username)  # Из базы данных
             username_for_blacklist = username
             if not user_id:
-                return f"Пользователь @{username} не найден в JSON. Возможно, он не писал сообщения или не добавлен. Попробуйте ввести его ID (число)."
+                return f"Пользователь @{username} не найден в базе данных. Возможно, он не писал сообщения или не добавлен. Попробуйте ввести его ID (число)."
         else:
             return "Неверный формат. Введите ID (число) или @username."
 
@@ -86,13 +87,13 @@ async def ban_user_by_id_or_username(identifier: str, until_date: int = 0, reaso
 
         # Добавляем в черный список
         if username_for_blacklist:
-            blacklist = load_blacklist()
+            blacklist = await load_blacklist()
             blacklist[username_for_blacklist] = {
                 "id": user_id,
                 "until": ban_until,
                 "reason": reason if reason else "Не указана"
             }
-            save_blacklist(blacklist)
+            await save_blacklist(blacklist)
             print(f"Пользователь @{username_for_blacklist} добавлен в черный список.")
 
         ban_type = "временно" if until_date > 0 else "постоянно"
@@ -130,18 +131,18 @@ async def unban_user_by_id_or_username(identifier: str) -> str:
             user_id = int(identifier)
             print(f"Разбаниваем по ID: {user_id}")
             # Для черного списка попробуем найти username по ID
-            users = load_users()
-            for uname, uid in users.items():
-                if uid == user_id:
+            users = await load_users()
+            for uname, data in users.items():
+                if data.get("id") == user_id:
                     username_for_blacklist = uname
                     break
         elif identifier.startswith('@'):  # Если @username
             username = identifier[1:]  # Убираем '@'
             print(f"Получаем ID по username: {username}")
-            user_id = get_user_id_by_username_in_group(username)  # Из JSON
+            user_id = await get_user_id_by_username_in_group(username)  # Из базы данных
             username_for_blacklist = username
             if not user_id:
-                return f"Пользователь @{username} не найден в JSON. Возможно, он не писал сообщения или не добавлен. Попробуйте ввести его ID (число)."
+                return f"Пользователь @{username} не найден в базе данных. Возможно, он не писал сообщения или не добавлен. Попробуйте ввести его ID (число)."
         else:
             return "Неверный формат. Введите ID (число) или @username."
 
@@ -150,10 +151,10 @@ async def unban_user_by_id_or_username(identifier: str) -> str:
 
         # Удаляем из черного списка
         if username_for_blacklist:
-            blacklist = load_blacklist()
+            blacklist = await load_blacklist()
             if username_for_blacklist in blacklist:
                 del blacklist[username_for_blacklist]
-                save_blacklist(blacklist)
+                await save_blacklist(blacklist)
                 print(f"Пользователь @{username_for_blacklist} удален из черного списка.")
 
         # Отправляем сообщение в чат
@@ -173,30 +174,34 @@ async def unban_user_by_id_or_username(identifier: str) -> str:
 
 async def check_expired_mutes():
     while True:
-        await asyncio.sleep(60)  # Проверяем каждые 60 секунд
-        users = load_users()
-        current_time = int(time.time())
-        to_unmute = []
-        for uname, data in users.items():
-            if data.get("muted_until", 0) > 0 and data["muted_until"] < current_time:
-                to_unmute.append(uname)
-                user_id = data["id"]
-                # Отправляем сообщение в чат
-                try:
-                    await bot.send_message(chat_id=GROUP_ID, text=f"Пользователь @{uname} больше не заглушен (мут истек).")
-                except Exception as e:
-                    print(f"Ошибка отправки в чат для @{uname}: {e}")
-                # Отправляем личное сообщение пользователю
-                try:
-                    await bot.send_message(chat_id=user_id, text="Ваш мут истек, вы больше не заглушены.")
-                except Exception as e:
-                    print(f"Не удалось отправить личное сообщение пользователю {user_id}: {e}")
-        if to_unmute:
-            for uname in to_unmute:
-                users[uname]["muted_until"] = 0
-                users[uname]["muted_reason"] = ""
-            save_users(users)
-            print(f"Удалены истекшие муты: {to_unmute}")
+        try:
+            await asyncio.sleep(60)  # Проверяем каждые 60 секунд
+            users = await load_users()
+            current_time = int(time.time())
+            to_unmute = []
+            for uname, data in users.items():
+                if data.get("muted_until", 0) > 0 and data["muted_until"] < current_time:
+                    to_unmute.append(uname)
+                    user_id = data["id"]
+                    # Отправляем сообщение в чат
+                    try:
+                        await bot.send_message(chat_id=GROUP_ID, text=f"Пользователь @{uname} больше не заглушен (мут истек).")
+                    except Exception as e:
+                        print(f"Ошибка отправки в чат для @{uname}: {e}")
+                    # Отправляем личное сообщение пользователю
+                    try:
+                        await bot.send_message(chat_id=user_id, text="Ваш мут истек, вы больше не заглушены.")
+                    except Exception as e:
+                        print(f"Не удалось отправить личное сообщение пользователю {user_id}: {e}")
+            if to_unmute:
+                for uname in to_unmute:
+                    users[uname]["muted_until"] = 0
+                    users[uname]["muted_reason"] = ""
+                await save_users(users)
+                print(f"Удалены истекшие муты: {to_unmute}")
+        except Exception as e:
+            print(f"Ошибка в check_expired_mutes: {e}")
+            await asyncio.sleep(60)  # Ждем перед следующей попыткой
     
 
 # Функция для мута по ID или username с временем и причиной
@@ -215,8 +220,8 @@ async def mute_user_by_id_or_username(identifier: str, until_date: int = 0, reas
         if identifier.isdigit():  # Если это ID (число)
             user_id = int(identifier)
             print(f"Мутим по ID: {user_id}")
-            # Для списка мутов попробуем найти username по ID (если есть в users.json)
-            users = load_users()
+            # Для списка мутов попробуем найти username по ID (если есть в базе данных)
+            users = await load_users()
             for uname, data in users.items():
                 if isinstance(data, dict) and data.get("id") == user_id:
                     username_for_muted = uname
@@ -224,10 +229,10 @@ async def mute_user_by_id_or_username(identifier: str, until_date: int = 0, reas
         elif identifier.startswith('@'):  # Если @username
             username = identifier[1:]  # Убираем '@'
             print(f"Получаем ID по username: {username}")
-            user_id = get_user_id_by_username_in_group(username)  # Из JSON
+            user_id = await get_user_id_by_username_in_group(username)  # Из базы данных
             username_for_muted = username
             if not user_id:
-                return f"Пользователь @{username} не найден в JSON. Возможно, он не писал сообщения или не добавлен. Попробуйте ввести его ID (число)."
+                return f"Пользователь @{username} не найден в базе данных. Возможно, он не писал сообщения или не добавлен. Попробуйте ввести его ID (число)."
         else:
             return "Неверный формат. Введите ID (число) или @username."
 
@@ -239,13 +244,13 @@ async def mute_user_by_id_or_username(identifier: str, until_date: int = 0, reas
         # Мутим пользователя
         await bot.restrict_chat_member(chat_id=GROUP_ID, user_id=user_id, permissions=permissions, until_date=mute_until if mute_until > 0 else None)
 
-        # Обновляем users.json (добавляем/обновляем данные о муте)
-        users = load_users()
+        # Обновляем базу данных (добавляем/обновляем данные о муте)
+        users = await load_users()
         if username_for_muted not in users:
             users[username_for_muted] = {"id": user_id}
         users[username_for_muted]["muted_until"] = mute_until
         users[username_for_muted]["muted_reason"] = reason if reason else "Не указана"
-        save_users(users)
+        await save_users(users)
 
         mute_type = "временно" if until_date > 0 else "постоянно"
         time_text = f" на {format_time(until_date)}" if until_date > 0 else ""
@@ -282,8 +287,8 @@ async def unmute_user_by_id_or_username(identifier: str) -> str:
         if identifier.isdigit():  # Если это ID (число)
             user_id = int(identifier)
             print(f"Размутиваем по ID: {user_id}")
-            # Для списка мутов попробуем найти username по ID (если есть в users.json)
-            users = load_users()
+            # Для списка мутов попробуем найти username по ID (если есть в базе данных)
+            users = await load_users()
             for uname, data in users.items():
                 if isinstance(data, dict) and data.get("id") == user_id:
                     username_for_muted = uname
@@ -291,10 +296,10 @@ async def unmute_user_by_id_or_username(identifier: str) -> str:
         elif identifier.startswith('@'):  # Если @username
             username = identifier[1:]  # Убираем '@'
             print(f"Получаем ID по username: {username}")
-            user_id = get_user_id_by_username_in_group(username)  # Из JSON
+            user_id = await get_user_id_by_username_in_group(username)  # Из базы данных
             username_for_muted = username
             if not user_id:
-                return f"Пользователь @{username} не найден в JSON. Возможно, он не писал сообщения или не добавлен. Попробуйте ввести его ID (число)."
+                return f"Пользователь @{username} не найден в базе данных. Возможно, он не писал сообщения или не добавлен. Попробуйте ввести его ID (число)."
         else:
             return "Неверный формат. Введите ID (число) или @username."
         
@@ -303,12 +308,12 @@ async def unmute_user_by_id_or_username(identifier: str) -> str:
         # Размутиваем пользователя
         await bot.restrict_chat_member(chat_id=GROUP_ID, user_id=user_id, permissions=permissions)
 
-        # Обновляем users.json (очищаем данные о муте)
-        users = load_users()
+        # Обновляем базу данных (очищаем данные о муте)
+        users = await load_users()
         if username_for_muted in users:
             users[username_for_muted]["muted_until"] = 0
             users[username_for_muted]["muted_reason"] = ""
-            save_users(users)
+            await save_users(users)
 
         # Отправляем сообщение в чат
         await bot.send_message(chat_id=GROUP_ID, text=f"Пользователь {identifier} больше не заглушен.")
@@ -421,7 +426,6 @@ async def process_unban(message: Message, state: FSMContext):
 
     await state.clear()
 
-
 @dp.callback_query(F.data == "mute")
 async def mute_func(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Mute.waiting_for_message)
@@ -497,7 +501,7 @@ async def process_unmute(message: Message, state: FSMContext):
 # Обработчик для показа черного списка
 @dp.callback_query(F.data == "black_list")
 async def show_blacklist(callback: CallbackQuery):
-    blacklist = load_blacklist()
+    blacklist = await load_blacklist()
     if not blacklist:
         await callback.message.answer("Черный список пуст.")
     else:
@@ -525,14 +529,14 @@ async def track_new_member(update: ChatMemberUpdated):
         user_id = user.id
 
         if username:
-            users = load_users()
+            users = await load_users()
             users[username] = {"id": user_id, "muted_until": 0, "muted_reason": ""}
-            save_users(users)
+            await save_users(users)
             print(f"Новый пользователь сохранен: @{username} -> {user_id}")
         else:
             print(f"Пользователь {user_id} без username — не сохранен.")
 
-# Обработчик для добавления пользователей, которые пишут сообщения в группе, если их нет в JSON
+# Обработчик для добавления пользователей, которые пишут сообщения в группе, если их нет в базе данных
 @dp.message(F.chat.id == GROUP_ID)
 async def add_user_on_message(message: Message):
     user = message.from_user
@@ -540,14 +544,15 @@ async def add_user_on_message(message: Message):
     user_id = user.id
 
     if username:
-           users = load_users()
-           if username not in users:
-               users[username] = {"id": user_id, "muted_until": 0, "muted_reason": ""}
-           save_users(users)
-           print(f"Пользователь добавлен по сообщению: @{username} -> {user_id}")
+        users = await load_users()
+        if username not in users:
+            users[username] = {"id": user_id, "muted_until": 0, "muted_reason": ""}
+        await save_users(users)
+        print(f"Пользователь добавлен по сообщению: @{username} -> {user_id}")
 
 async def main():
-    # Запускаем фоновую задачу для проверки истекших банов
+    await init_db()
+    # Запускаем фоновые задачи для проверки истекших банов и мутов
     asyncio.create_task(check_expired_bans())
     asyncio.create_task(check_expired_mutes())
     await dp.start_polling(bot)
