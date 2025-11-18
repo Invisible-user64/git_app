@@ -16,3 +16,11 @@ class Mute(StatesGroup):
 
 class Unmute(StatesGroup):
     waiting_for_message = State()
+
+class Warn(StatesGroup):
+    waiting_for_message = State()
+    waiting_for_time = State()
+    waiting_for_reason = State()
+
+class Unwarn(StatesGroup):
+    waiting_for_message = State()

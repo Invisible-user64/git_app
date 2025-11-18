@@ -14,7 +14,8 @@ async def init_db():
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT UNIQUE NOT NULL,
-                    user_id INTEGER NOT NULL
+                    user_id INTEGER NOT NULL,
+                    warnings INTEGER NOT NULL           
                 )
             """)
             await conn.execute("""
@@ -39,7 +40,8 @@ async def init_db():
                     CREATE TABLE users_temp (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         username TEXT UNIQUE NOT NULL,
-                        user_id INTEGER NOT NULL
+                        user_id INTEGER NOT NULL,
+                        warnings INTEGER NOT NULL
                     )
                 """)
                 # Копируем существующие данные (id присвоится автоматически: 1, 2, 3...)
@@ -76,7 +78,7 @@ async def save_users(users):
             for username, data in users.items():
                 # Вставляем с автоинкрементом id (если db_id есть, используем его; иначе - NULL для авто)
                 db_id = data.get("db_id", None)
-                await conn.execute("INSERT INTO users (id, username, user_id) VALUES (?, ?, ?)", (db_id, username, data["id"]))
+                await conn.execute("INSERT INTO users (id, username, user_id, warnings) VALUES (?, ?, ?, ?)", (db_id, username, data["id"], 0))
             await conn.commit()
     except Exception as e:
         print(f"Ошибка сохранения пользователей: {e}")
@@ -110,6 +112,123 @@ async def save_blacklist(blacklist):
             await conn.commit()
     except Exception as e:
         print(f"Ошибка сохранения blacklist: {e}")
+
+async def increment_warnings(username: str = None, user_id: int = None):
+    """
+    Увеличивает warnings на 1 для пользователя по username или user_id.
+    Возвращает True, если обновление прошло успешно, иначе False.
+    """
+    if not username and not user_id:
+        print("Ошибка: укажите username или user_id.")
+    
+    try:
+        async with aiosqlite.connect(DB_NAME) as conn:
+            # Определяем условие поиска
+            if user_id is not None:
+                condition = "WHERE user_id = ?"
+                param = (user_id,)
+            else:
+                condition = "WHERE username = ?"
+                param = (username,)
+            
+            # Обновляем warnings
+            await conn.execute(
+                f"UPDATE users SET warnings = warnings + 1 {condition}",
+                param
+            )
+            await conn.commit()
+            
+            # Проверяем, сколько строк обновлено
+            cursor = await conn.execute("SELECT changes()")
+            changes = await cursor.fetchone()
+            if changes and changes[0] > 0:
+                identifier = user_id if user_id else username
+                print(f"Warnings для {identifier} увеличены на 1.")
+
+            else:
+                identifier = user_id if user_id else username
+                print(f"Пользователь с {identifier} не найден.")
+
+    except Exception as e:
+        print(f"Ошибка при увеличении warnings: {e}")
+
+async def decrement_warnings(username: str = None, user_id: int = None):
+    """
+    Уменьшает warnings на 1 для пользователя по username или user_id.
+    Возвращает True, если обновление прошло успешно, иначе False.
+    """
+    if not username and not user_id:
+        print("Ошибка: укажите username или user_id.")
+    
+    try:
+        async with aiosqlite.connect(DB_NAME) as conn:
+            # Определяем условие поиска
+            if user_id is not None:
+                condition = "WHERE user_id = ?"
+                param = (user_id,)
+            else:
+                condition = "WHERE username = ?"
+                param = (username,)
+            
+            # Обновляем warnings
+            await conn.execute(
+                f"UPDATE users SET warnings = warnings - 1 {condition}",
+                param
+            )
+            await conn.commit()
+            
+            # Проверяем, сколько строк обновлено
+            cursor = await conn.execute("SELECT changes()")
+            changes = await cursor.fetchone()
+            if changes and changes[0] > 0:
+                identifier = user_id if user_id else username
+                print(f"Warnings для {identifier} уменьшены на 1.")
+
+            else:
+                identifier = user_id if user_id else username
+                print(f"Пользователь с {identifier} не найден.")
+
+    except Exception as e:
+        print(f"Ошибка при увеличении warnings: {e}")
+
+async def load_warnings_count(username: str = None, user_id: int = None) -> int | None:
+    """
+    Возвращает количество предупреждений пользователя по username или user_id.
+    Возвращает None, если пользователь не найден.
+    """
+    if not username and not user_id:
+        print("Ошибка: укажите username или user_id.")
+        return None
+    
+    try:
+        async with aiosqlite.connect(DB_NAME) as conn:
+            # Определяем условие поиска
+            if user_id is not None:
+                condition = "WHERE user_id = ?"
+                param = (user_id,)
+            else:
+                condition = "WHERE username = ?"
+                param = (username,)
+            
+            # Выполняем SELECT для получения warnings
+            cursor = await conn.execute(
+                f"SELECT warnings FROM users {condition}",
+                param
+            )
+            result = await cursor.fetchone()
+            
+            if result:
+                warnings_count = result[0]
+                identifier = user_id if user_id else username
+                print(f"Warnings для {identifier}: {warnings_count}")
+                return warnings_count
+            else:
+                identifier = user_id if user_id else username
+                print(f"Пользователь с {identifier} не найден.")
+                return None
+    except Exception as e:
+        print(f"Ошибка при загрузке warnings: {e}")
+        return None
 
 # Остальные функции без изменений
 time_designation = {"s": 1, "m": 60, "h": 3600, "d": 86400}

@@ -5,12 +5,12 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember, ChatMemberUpdated, ChatPermissions
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 
 from config import TOKEN, ADMIN_ID, GROUP_ID
 from functions import load_users, save_users, load_blacklist, save_blacklist, parse_time, format_time, get_user_id_by_username_in_group, init_db
+from functions import increment_warnings, decrement_warnings, load_warnings_count
 from keyboards import cmd_start_kb, cmds_kb
-from FSM import Ban, Unban, Mute, Unmute
+from FSM import Ban, Unban, Mute, Unmute, Warn, Unwarn
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -302,7 +302,7 @@ async def unmute_user_by_id_or_username(identifier: str) -> str:
                 return f"Пользователь @{username} не найден в базе данных. Возможно, он не писал сообщения или не добавлен. Попробуйте ввести его ID (число)."
         else:
             return "Неверный формат. Введите ID (число) или @username."
-        
+
         permissions = ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True, can_change_info=True, can_invite_users=True, can_pin_messages=True)
 
         # Размутиваем пользователя
@@ -327,6 +327,147 @@ async def unmute_user_by_id_or_username(identifier: str) -> str:
         return f"Пользователь {identifier} размучен."
     except Exception as e:
         print(f"Ошибка при размуте: {e}")
+        return f"Ошибка: {str(e)}. Проверьте права бота или ID группы."
+    
+
+
+async def warn_user_by_id_or_username(identifier: str, until_date: int = 0, reason: str = "") -> str:
+    """
+    Выдать предупреждение пользователю по ID (число) или @username с указанным временем и причиной.
+    Возвращает сообщение об успехе или ошибке.
+    """
+    try:
+        # Проверяем тип чата
+        chat = await bot.get_chat(GROUP_ID)
+        if chat.type not in ["supergroup", "channel"]:
+            return f"Ошибка: Бан доступен только в супергруппах и каналах. Тип чата: {chat.type}."
+
+        username_for_blacklist = None
+        if identifier.isdigit():  # Если это ID (число)
+            user_id = int(identifier)
+            print(f"Выдаём придупреждение по ID: {user_id}")
+            # Выдаём предупреждение пользователю
+            await increment_warnings(user_id=user_id)
+            warning_count = await load_warnings_count(user_id=user_id)
+            # Для черного списка попробуем найти username по ID (если есть в базе данных)
+            users = await load_users()
+            for uname, data in users.items():
+                if data.get("id") == user_id:
+                    username_for_blacklist = uname
+                    break
+        elif identifier.startswith('@'):  # Если @usernameЫЫЫ
+            username = identifier[1:]  # Убираем '@'
+            print(f"Получаем ID по username: {username}")
+            user_id = await get_user_id_by_username_in_group(username)  # Из базы данных
+            username_for_blacklist = username
+            # Выдаём предупреждение пользователю
+            await increment_warnings(username=username)
+            warning_count = await load_warnings_count(username=username)
+            if not user_id:
+                return f"Пользователь @{username} не найден в базе данных. Возможно, он не писал сообщения или не добавлен. Попробуйте ввести его ID (число)."
+        else:
+            return "Неверный формат. Введите ID (число) или @username."
+        
+        if warning_count >= 3:
+            await bot.ban_chat_member(chat_id=GROUP_ID, user_id=user_id, until_date=0)
+
+            # Добавляем в черный список
+            if username_for_blacklist:
+                blacklist = await load_blacklist()
+                blacklist[username_for_blacklist] = {
+                    "id": user_id,
+                    "until": 0,
+                    "reason": reason if reason else "Не указана"
+                }
+                await save_blacklist(blacklist)
+                print(f"Пользователь @{username_for_blacklist} добавлен в черный список.")
+        
+
+            # Отправляем сообщение в чат
+            await bot.send_message(chat_id=GROUP_ID, text=f"Пользователь {identifier} забанен постоенно по причине: Правила были нарушены 3 раза.")
+
+            # Отправляем личное сообщение пользователю
+            try:
+                await bot.send_message(chat_id=user_id, text=f"Вы забанены постоенно по причине: Правила были нарушены 3 раза.")
+            except Exception as e:
+                print(f"Не удалось отправить личное сообщение пользователю {user_id}: {e}")
+
+            return f"Пользователь {identifier} забанен постоенно и добавлен в черный список." + (f"\nПричина: Правила были нарушены 3 раза.")
+
+        else:
+            # Вычисляем until_date
+            warn_until = int(time.time()) + until_date if until_date > 0 else 0
+
+            # Добавляем в список предупреждений,я хз ещё думаем как реализовать
+
+
+            warn_type = "временное" if until_date > 0 else "постоянное"
+            time_text = f" на {format_time(until_date)}" if until_date > 0 else ""
+            reason_text = f" по причине: {reason}" if reason else ""
+            
+
+            # Отправляем сообщение в чат
+            await bot.send_message(chat_id=GROUP_ID, text=f"Пользователю {identifier} было выдано {warn_type} предупреждение{time_text}{reason_text}.\nПредупреждений осталось: {3-warning_count}.")
+
+            # Отправляем личное сообщение пользователю
+            try:
+                await bot.send_message(chat_id=user_id, text=f"Вам выдано {warn_type} предупреждение{time_text}{reason_text}.\nПредупреждений осталось: {3-warning_count}.")
+            except Exception as e:
+                print(f"Не удалось отправить личное сообщение пользователю {user_id}: {e}")
+
+            return f"Пользователю {identifier} выдано {warn_type} предупреждение {time_text}" + (f"\nПричина: {reason}" if reason else "") + f"Предупреждений осталось: {3-warning_count}."
+    except Exception as e:
+        print(f"Ошибка при выдаче предупреждения: {e}, warning_count = {warning_count}, {identifier}")
+        return f"Ошибка: {str(e)}. Проверьте права бота или ID группы."
+    
+# Новая функция для разбана по ID или username
+async def unwarn_user_by_id_or_username(identifier: str) -> str:
+    """
+    Снять предупреждение с пользователя по ID (число) или @username.
+    Возвращает сообщение об успехе или ошибке.
+    """
+    try:
+        # Проверяем тип чата
+        chat = await bot.get_chat(GROUP_ID)
+        if chat.type not in ["supergroup", "channel"]:
+            return f"Ошибка: Разбан доступен только в супергруппах и каналах. Тип чата: {chat.type}."
+
+        username_for_blacklist = None
+        if identifier.isdigit():  # Если это ID (число)
+            user_id = int(identifier)
+            print(f"Разбаниваем по ID: {user_id}")
+            await decrement_warnings(user_id=user_id)
+            warning_count = await load_warnings_count(user_id=user_id)
+            # Для черного списка попробуем найти username по ID ПОКА ОСТАВЛЮ
+            users = await load_users()
+            for uname, data in users.items():
+                if data.get("id") == user_id:
+                    username_for_blacklist = uname
+                    break
+        elif identifier.startswith('@'):  # Если @username
+            username = identifier[1:]  # Убираем '@'
+            print(f"Получаем ID по username: {username}")
+            user_id = await get_user_id_by_username_in_group(username)  # Из базы данных
+            username_for_blacklist = username
+            await decrement_warnings(username=username)
+            warning_count = await load_warnings_count(username=username)
+            if not user_id:
+                return f"Пользователь @{username} не найден в базе данных. Возможно, он не писал сообщения или не добавлен. Попробуйте ввести его ID (число)."
+        else:
+            return "Неверный формат. Введите ID (число) или @username."
+
+        # Отправляем сообщение в чат
+        await bot.send_message(chat_id=GROUP_ID, text=f"Пользователю {identifier} сняли 1 предупреждение.")
+
+        # Отправляем личное сообщение пользователю
+        try:
+            await bot.send_message(chat_id=user_id, text="Вам сняли одно предупреждение.")
+        except Exception as e:
+            print(f"Не удалось отправить личное сообщение пользователю {user_id}: {e}")
+
+        return f"Пользователю {identifier} сняли предупрждение."
+    except Exception as e:
+        print(f"Ошибка при разбане: {e}")
         return f"Ошибка: {str(e)}. Проверьте права бота или ID группы."
 
 
@@ -497,6 +638,85 @@ async def process_unmute(message: Message, state: FSMContext):
     await message.answer(result)
 
     await state.clear()
+
+@dp.callback_query(F.data == "warn")
+async def warn_func(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Warn.waiting_for_message)
+    await callback.message.answer("Введите @username или ID пользователя:")
+
+@dp.message(Warn.waiting_for_message)
+async def process_warn_identifier(message: Message, state: FSMContext):
+    identifier = message.text.strip()
+    await state.update_data(identifier=identifier)
+    await state.set_state(Warn.waiting_for_time)
+    await message.answer(
+        "Введите время бана в формате Nt (например, 1h для 1 часа, 30m для 30 минут):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Бесконечное придупреждение", callback_data="infinite_warn")]])
+    )
+
+@dp.message(Warn.waiting_for_time)
+async def process_warn_time(message: Message, state: FSMContext):
+    time_str = message.text.strip()
+    until_seconds = parse_time(time_str)
+    await state.update_data(until_seconds=until_seconds)
+    await state.set_state(Warn.waiting_for_reason)
+    await message.answer(
+        "Введите причину предупреждения:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Пропустить причину", callback_data="skip_warn_reason")]])
+    )
+
+@dp.callback_query(F.data == "infinite_warn", Warn.waiting_for_time)
+async def infinite_warn(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(until_seconds=0)
+    await state.set_state(Warn.waiting_for_reason)
+    await callback.message.edit_text(
+        "Введите причину предупреждения:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Пропустить причину", callback_data="skip_warn_reason")]])
+    )
+
+@dp.message(Warn.waiting_for_reason)
+async def process_warn_reason(message: Message, state: FSMContext):
+    reason = message.text.strip()
+    data = await state.get_data()
+    identifier = data.get("identifier")
+    until_seconds = data.get("until_seconds", 0)
+
+    result = await warn_user_by_id_or_username(identifier, until_seconds, reason)
+    await message.answer(result)
+
+    await state.clear()
+
+@dp.callback_query(F.data == "skip_warn_reason", Warn.waiting_for_reason)
+async def skip_reason(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    identifier = data.get("identifier")
+    until_seconds = data.get("until_seconds", 0)
+
+    result = await warn_user_by_id_or_username(identifier, until_seconds, "")
+    await callback.message.edit_text(result)
+
+    await state.clear()
+
+@dp.callback_query(F.data == "unwarn")
+async def unwarn_func(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Unwarn.waiting_for_message)
+    await callback.message.answer("Введите @username или ID пользователя для снятия предупреждения:")
+
+@dp.message(Unwarn.waiting_for_message)
+async def process_unmute(message: Message, state: FSMContext):
+    identifier = message.text.strip()
+    username = identifier[1:]
+    warning_count = await load_warnings_count(username=username)
+    print(warning_count, username)
+
+    if warning_count == 0:
+        await message.answer("У этого пользователя нет предупреждений")
+    
+    else:
+        result = await unwarn_user_by_id_or_username(identifier)
+        await message.answer(result)
+
+        await state.clear()
 
 # Обработчик для показа черного списка
 @dp.callback_query(F.data == "black_list")
