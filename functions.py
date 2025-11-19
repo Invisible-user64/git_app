@@ -2,8 +2,9 @@ import aiosqlite
 import json
 import re
 import os
+import time 
 
-DB_NAME = 'bot.sqlite'
+from config import DB_NAME
 
 # Функция для инициализации БД (вызывайте один раз, теперь async)
 async def init_db():
@@ -15,7 +16,10 @@ async def init_db():
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT UNIQUE NOT NULL,
                     user_id INTEGER NOT NULL,
-                    warnings INTEGER NOT NULL           
+                    warnings INTEGER NOT NULL,
+                    warning_1_data INTEGER NOT NULL,
+                    warning_2_data INTEGER NOT NULL,   
+                    warning_3_data INTEGER NOT NULL
                 )
             """)
             await conn.execute("""
@@ -41,7 +45,10 @@ async def init_db():
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         username TEXT UNIQUE NOT NULL,
                         user_id INTEGER NOT NULL,
-                        warnings INTEGER NOT NULL
+                        warnings INTEGER NOT NULL,
+                        warning_1_data INTEGER NOT NULL,
+                        warning_2_data INTEGER NOT NULL,   
+                        warning_3_data INTEGER NOT NULL
                     )
                 """)
                 # Копируем существующие данные (id присвоится автоматически: 1, 2, 3...)
@@ -78,7 +85,7 @@ async def save_users(users):
             for username, data in users.items():
                 # Вставляем с автоинкрементом id (если db_id есть, используем его; иначе - NULL для авто)
                 db_id = data.get("db_id", None)
-                await conn.execute("INSERT INTO users (id, username, user_id, warnings) VALUES (?, ?, ?, ?)", (db_id, username, data["id"], 0))
+                await conn.execute("INSERT INTO users (id, username, user_id, warnings, warning_1_data, warning_2_data, warning_3_data) VALUES (?, ?, ?, ?, ?, ?, ?)", (db_id, username, data["id"], 0, 0, 0, 0))
             await conn.commit()
     except Exception as e:
         print(f"Ошибка сохранения пользователей: {e}")
@@ -229,6 +236,83 @@ async def load_warnings_count(username: str = None, user_id: int = None) -> int 
     except Exception as e:
         print(f"Ошибка при загрузке warnings: {e}")
         return None
+
+async def set_warning_expiry(username: str = None, user_id: int = None, expiry_time: int = None):
+    """
+    Устанавливает время окончания предупреждения (timestamp) в соответствующий столбец.
+    expiry_time: длительность в секундах (например, 3600 для 1 часа). Конвертируется в timestamp (текущее время + длительность).
+    Если expiry_time == 0 (бесконечное), ничего не устанавливает.
+    """
+    if not username and not user_id:
+        print("Ошибка: укажите username или user_id.")
+        return False
+    if expiry_time is None:
+        print("Ошибка: укажите expiry_time.")
+        return False
+    
+    # Если бесконечное предупреждение, не устанавливаем expiry
+    if expiry_time == 0:
+        print("Бесконечное предупреждение: expiry не установлен.")
+        return True
+    
+    # Конвертируем длительность в timestamp
+    timestamp = int(time.time()) + expiry_time
+    
+    try:
+        async with aiosqlite.connect(DB_NAME) as conn:
+            # Определяем условие поиска
+            if user_id is not None:
+                condition = "WHERE user_id = ?"
+                param = (user_id,)
+            else:
+                condition = "WHERE username = ?"
+                param = (username,)
+            
+            # Получаем текущее значение warnings
+            cursor = await conn.execute(f"SELECT warnings FROM users {condition}", param)
+            result = await cursor.fetchone()
+            if not result:
+                identifier = user_id if user_id else username
+                print(f"Пользователь с {identifier} не найден.")
+                return False
+            
+            warnings_count = result[0]
+            
+            # Определяем, какой столбец обновлять
+            if warnings_count == 1:
+                column = "warning_1_data"
+            elif warnings_count == 2:
+                column = "warning_2_data"
+            elif warnings_count == 3:
+                column = "warning_3_data"
+            else:
+                identifier = user_id if user_id else username
+                print(f"Невозможно установить expiry для {identifier}: warnings = {warnings_count} (должен быть 1-3).")
+                return False
+            
+            # Обновляем соответствующий столбец с timestamp
+            await conn.execute(
+                f"UPDATE users SET {column} = ? {condition}",
+                (timestamp, *param)
+            )
+            await conn.commit()
+            
+            # Проверяем, сколько строк обновлено
+            cursor = await conn.execute("SELECT changes()")
+            changes = await cursor.fetchone()
+            if changes and changes[0] > 0:
+                identifier = user_id if user_id else username
+                print(f"Expiry time для {identifier} установлен в {column}: {timestamp} (timestamp)")
+                return True
+            else:
+                identifier = user_id if user_id else username
+                print(f"Не удалось обновить expiry для {identifier}.")
+                return False
+    except Exception as e:
+        print(f"Ошибка при установке expiry time: {e}")
+        return False
+
+
 
 # Остальные функции без изменений
 time_designation = {"s": 1, "m": 60, "h": 3600, "d": 86400}

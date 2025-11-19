@@ -1,14 +1,15 @@
 import asyncio
 import re
+import aiosqlite
 import time  # Добавлен импорт для работы с временем
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember, ChatMemberUpdated, ChatPermissions
 from aiogram.fsm.context import FSMContext
 
-from config import TOKEN, ADMIN_ID, GROUP_ID
+from config import TOKEN, ADMIN_ID, GROUP_ID, DB_NAME
 from functions import load_users, save_users, load_blacklist, save_blacklist, parse_time, format_time, get_user_id_by_username_in_group, init_db
-from functions import increment_warnings, decrement_warnings, load_warnings_count
+from functions import increment_warnings, decrement_warnings, load_warnings_count, set_warning_expiry
 from keyboards import cmd_start_kb, cmds_kb
 from FSM import Ban, Unban, Mute, Unmute, Warn, Unwarn
 
@@ -329,7 +330,47 @@ async def unmute_user_by_id_or_username(identifier: str) -> str:
         print(f"Ошибка при размуте: {e}")
         return f"Ошибка: {str(e)}. Проверьте права бота или ID группы."
     
-
+async def check_expired_warnings():
+    while True:
+        try:
+            await asyncio.sleep(60)  # Проверяем каждые 60 секунд
+            async with aiosqlite.connect(DB_NAME) as conn:
+                cursor = await conn.execute("SELECT id, username, user_id, warnings, warning_1_data, warning_2_data, warning_3_data FROM users")
+                rows = await cursor.fetchall()
+                current_time = int(time.time())
+                for row in rows:
+                    db_id, username, user_id, warnings, w1, w2, w3 = row
+                    expired_columns = []
+                    if w1 > 0 and w1 < current_time:
+                        expired_columns.append("warning_1_data")
+                    if w2 > 0 and w2 < current_time:
+                        expired_columns.append("warning_2_data")
+                    if w3 > 0 and w3 < current_time:
+                        expired_columns.append("warning_3_data")
+                    
+                    if expired_columns:
+                        # Уменьшаем warnings на количество истекших
+                        decrement_count = len(expired_columns)
+                        new_warnings = max(0, warnings - decrement_count)
+                        await conn.execute(
+                            "UPDATE users SET warnings = ?, warning_1_data = CASE WHEN warning_1_data < ? THEN 0 ELSE warning_1_data END, warning_2_data = CASE WHEN warning_2_data < ? THEN 0 ELSE warning_2_data END, warning_3_data = CASE WHEN warning_3_data < ? THEN 0 ELSE warning_3_data END WHERE id = ?",
+                            (new_warnings, current_time, current_time, current_time, db_id)
+                        )
+                        # Отправляем сообщение в чат
+                        try:
+                            await bot.send_message(chat_id=GROUP_ID, text=f"У пользователя @{username} истекло {decrement_count} предупреждение(й). Осталось предупреждений: {new_warnings}.")
+                        except Exception as e:
+                            print(f"Ошибка отправки в чат для @{username}: {e}")
+                        # Отправляем личное сообщение пользователю
+                        try:
+                            await bot.send_message(chat_id=user_id, text=f"У вас истекло {decrement_count} предупреждение(й). Осталось предупреждений: {new_warnings}.")
+                        except Exception as e:
+                            print(f"Не удалось отправить личное сообщение пользователю {user_id}: {e}")
+                await conn.commit()
+        except Exception as e:
+            print(f"Ошибка в check_expired_warnings: {e}")
+            await asyncio.sleep(60)  # Ждем перед следующей попыткой
+    
 
 async def warn_user_by_id_or_username(identifier: str, until_date: int = 0, reason: str = "") -> str:
     """
@@ -415,7 +456,7 @@ async def warn_user_by_id_or_username(identifier: str, until_date: int = 0, reas
             except Exception as e:
                 print(f"Не удалось отправить личное сообщение пользователю {user_id}: {e}")
 
-            return f"Пользователю {identifier} выдано {warn_type} предупреждение {time_text}" + (f"\nПричина: {reason}" if reason else "") + f"Предупреждений осталось: {3-warning_count}."
+            return f"Пользователю {identifier} выдано {warn_type} предупреждение {time_text}" + (f"\nПричина: {reason}" if reason else "") + f" Предупреждений осталось: {3-warning_count}."
     except Exception as e:
         print(f"Ошибка при выдаче предупреждения: {e}, warning_count = {warning_count}, {identifier}")
         return f"Ошибка: {str(e)}. Проверьте права бота или ID группы."
@@ -677,13 +718,41 @@ async def infinite_warn(callback: CallbackQuery, state: FSMContext):
 @dp.message(Warn.waiting_for_reason)
 async def process_warn_reason(message: Message, state: FSMContext):
     reason = message.text.strip()
+    reason = message.text.strip()
     data = await state.get_data()
     identifier = data.get("identifier")
     until_seconds = data.get("until_seconds", 0)
-
+    
+    user_id = None
+    if identifier.startswith('@'):
+        username = identifier[1:]
+        user_id = await get_user_id_by_username_in_group(username)
+        if user_id is None:
+            # Пользователь не найден, используем user_id из callback (предполагая, что это цель)
+            user_id = message.from_user.id  # Замените на правильный user_id, если известен иначе
+            # Вставляем в БД
+            try:
+                async with aiosqlite.connect(DB_NAME) as conn:
+                    await conn.execute("""
+                        INSERT INTO users (username, user_id, warnings, warning_1_data, warning_2_data, warning_3_data) 
+                        VALUES (?, ?, 0, 0, 0, 0)
+                    """, (username, user_id))
+                    await conn.commit()
+                print(f"Пользователь @{username} с user_id {user_id} добавлен.")
+            except Exception as e:
+                print(f"Ошибка добавления пользователя @{username}: {e}")
+                await message.answer("Ошибка: не удалось добавить пользователя.")
+                await state.clear()
+                return
+    elif identifier.isdigit():
+        user_id = int(identifier)
+    
     result = await warn_user_by_id_or_username(identifier, until_seconds, reason)
     await message.answer(result)
-
+    
+    # Теперь user_id известен, вызываем set_warning_expiry
+    await set_warning_expiry(user_id=user_id, expiry_time=until_seconds)
+    
     await state.clear()
 
 @dp.callback_query(F.data == "skip_warn_reason", Warn.waiting_for_reason)
@@ -691,11 +760,39 @@ async def skip_reason(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     identifier = data.get("identifier")
     until_seconds = data.get("until_seconds", 0)
-
+    
+    user_id = None
+    if identifier.startswith('@'):
+        username = identifier[1:]
+        user_id = await get_user_id_by_username_in_group(username)
+        if user_id is None:
+            # Пользователь не найден, используем user_id из callback (предполагая, что это цель)
+            user_id = callback.from_user.id  # Замените на правильный user_id, если известен иначе
+            # Вставляем в БД
+            try:
+                async with aiosqlite.connect(DB_NAME) as conn:
+                    await conn.execute("""
+                        INSERT INTO users (username, user_id, warnings, warning_1_data, warning_2_data, warning_3_data) 
+                        VALUES (?, ?, 0, 0, 0, 0)
+                    """, (username, user_id))
+                    await conn.commit()
+                print(f"Пользователь @{username} с user_id {user_id} добавлен.")
+            except Exception as e:
+                print(f"Ошибка добавления пользователя @{username}: {e}")
+                await callback.message.edit_text("Ошибка: не удалось добавить пользователя.")
+                await state.clear()
+                return
+    elif identifier.isdigit():
+        user_id = int(identifier)
+    
     result = await warn_user_by_id_or_username(identifier, until_seconds, "")
     await callback.message.edit_text(result)
-
+    
+    # Теперь user_id известен, вызываем set_warning_expiry
+    await set_warning_expiry(user_id=user_id, expiry_time=until_seconds)
+    
     await state.clear()
+
 
 @dp.callback_query(F.data == "unwarn")
 async def unwarn_func(callback: CallbackQuery, state: FSMContext):
@@ -775,6 +872,7 @@ async def main():
     # Запускаем фоновые задачи для проверки истекших банов и мутов
     asyncio.create_task(check_expired_bans())
     asyncio.create_task(check_expired_mutes())
+    asyncio.create_task(check_expired_warnings())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
