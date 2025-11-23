@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 
 from config import TOKEN, ADMIN_ID, GROUP_ID, DB_NAME
 from functions import load_users, save_users, load_blacklist, save_blacklist, parse_time, format_time, get_user_id_by_username_in_group, init_db
-from functions import increment_warnings, decrement_warnings, load_warnings_count, set_warning_expiry
+from functions import increment_warnings, decrement_warnings, load_warnings_count, set_warning_expiry, check_forbidden_words
 from keyboards import cmd_start_kb, cmds_kb
 from FSM import Ban, Unban, Mute, Unmute, Warn, Unwarn
 
@@ -510,6 +510,15 @@ async def unwarn_user_by_id_or_username(identifier: str) -> str:
     except Exception as e:
         print(f"Ошибка при разбане: {e}")
         return f"Ошибка: {str(e)}. Проверьте права бота или ID группы."
+
+
+@dp.message(F.chat.id == GROUP_ID)
+async def moderation(message: Message):
+    text = message.text
+    username = f"@{message.from_user.username}"
+    if check_forbidden_words(text=text):
+        await ban_user_by_id_or_username(identifier=username, until_date=0, reason="Было произнесенно запретное слово")
+
 
 
 # Новый обработчик для проверки группы

@@ -120,6 +120,45 @@ async def save_blacklist(blacklist):
     except Exception as e:
         print(f"Ошибка сохранения blacklist: {e}")
 
+async def load_warnings_count(username: str = None, user_id: int = None) -> int | None:
+    """
+    Возвращает количество предупреждений пользователя по username или user_id.
+    Возвращает None, если пользователь не найден.
+    """
+    if not username and not user_id:
+        print("Ошибка: укажите username или user_id.")
+        return None
+    
+    try:
+        async with aiosqlite.connect(DB_NAME) as conn:
+            # Определяем условие поиска
+            if user_id is not None:
+                condition = "WHERE user_id = ?"
+                param = (user_id,)
+            else:
+                condition = "WHERE username = ?"
+                param = (username,)
+            
+            # Выполняем SELECT для получения warnings
+            cursor = await conn.execute(
+                f"SELECT warnings FROM users {condition}",
+                param
+            )
+            result = await cursor.fetchone()
+            
+            if result:
+                warnings_count = result[0]
+                identifier = user_id if user_id else username
+                print(f"Warnings для {identifier}: {warnings_count}")
+                return warnings_count
+            else:
+                identifier = user_id if user_id else username
+                print(f"Пользователь с {identifier} не найден.")
+                return None
+    except Exception as e:
+        print(f"Ошибка при загрузке warnings: {e}")
+        return None
+
 async def increment_warnings(username: str = None, user_id: int = None):
     """
     Увеличивает warnings на 1 для пользователя по username или user_id.
@@ -166,21 +205,36 @@ async def decrement_warnings(username: str = None, user_id: int = None):
     """
     if not username and not user_id:
         print("Ошибка: укажите username или user_id.")
+        return False
     
     try:
         async with aiosqlite.connect(DB_NAME) as conn:
             # Определяем условие поиска
             if user_id is not None:
+                warnings_count_raw = await load_warnings_count(user_id=user_id)
                 condition = "WHERE user_id = ?"
                 param = (user_id,)
             else:
+                warnings_count_raw = await load_warnings_count(username=username)
                 condition = "WHERE username = ?"
                 param = (username,)
+            
+            # Преобразуем и проверяем warnings_count
+            try:
+                warnings_count = int(warnings_count_raw)  # Преобразуем в int
+                if warnings_count < 0:
+                    raise ValueError("warnings_count не может быть отрицательным")
+            except (ValueError, TypeError):
+                print(f"Ошибка: warnings_count '{warnings_count_raw}' не является допустимым целым числом.")
+                return False
             
             # Обновляем warnings
             await conn.execute(
                 f"UPDATE users SET warnings = warnings - 1 {condition}",
                 param
+            )
+            await conn.execute(
+                f"UPDATE users SET warning_{warnings_count}_data = 0 {condition}", param
             )
             await conn.commit()
             
@@ -190,52 +244,17 @@ async def decrement_warnings(username: str = None, user_id: int = None):
             if changes and changes[0] > 0:
                 identifier = user_id if user_id else username
                 print(f"Warnings для {identifier} уменьшены на 1.")
-
+                return True
             else:
                 identifier = user_id if user_id else username
                 print(f"Пользователь с {identifier} не найден.")
-
-    except Exception as e:
-        print(f"Ошибка при увеличении warnings: {e}")
-
-async def load_warnings_count(username: str = None, user_id: int = None) -> int | None:
-    """
-    Возвращает количество предупреждений пользователя по username или user_id.
-    Возвращает None, если пользователь не найден.
-    """
-    if not username and not user_id:
-        print("Ошибка: укажите username или user_id.")
-        return None
+                return False
     
-    try:
-        async with aiosqlite.connect(DB_NAME) as conn:
-            # Определяем условие поиска
-            if user_id is not None:
-                condition = "WHERE user_id = ?"
-                param = (user_id,)
-            else:
-                condition = "WHERE username = ?"
-                param = (username,)
-            
-            # Выполняем SELECT для получения warnings
-            cursor = await conn.execute(
-                f"SELECT warnings FROM users {condition}",
-                param
-            )
-            result = await cursor.fetchone()
-            
-            if result:
-                warnings_count = result[0]
-                identifier = user_id if user_id else username
-                print(f"Warnings для {identifier}: {warnings_count}")
-                return warnings_count
-            else:
-                identifier = user_id if user_id else username
-                print(f"Пользователь с {identifier} не найден.")
-                return None
     except Exception as e:
-        print(f"Ошибка при загрузке warnings: {e}")
-        return None
+        print(f"Ошибка при уменьшении warnings: {e}")
+        return False
+
+
 
 async def set_warning_expiry(username: str = None, user_id: int = None, expiry_time: int = None):
     """
@@ -312,7 +331,39 @@ async def set_warning_expiry(username: str = None, user_id: int = None, expiry_t
         print(f"Ошибка при установке expiry time: {e}")
         return False
 
-
+def check_forbidden_words(text: str) -> bool:
+    """
+    Проверяет, содержит ли сообщение запрещённые слова из файла forbidden_words.txt.
+    Возвращает True, если найдено хотя бы одно слово, иначе False.
+    """
+    # Путь к файлу (предполагается, что он в той же директории)
+    file_path = "forbidden_words.txt"
+    
+    # Если файл не существует, возвращаем False
+    if not os.path.exists(file_path):
+        return False
+    
+    try:
+        # Читаем файл и создаём список слов (в нижнем регистре, без пустых строк)
+        with open(file_path, "r", encoding="utf-8") as file:
+            forbidden_words = [line.strip().lower() for line in file if line.strip()]
+        
+        # Если список пуст, возвращаем False
+        if not forbidden_words:
+            return False
+        
+        # Преобразуем сообщение в нижний регистр и проверяем наличие слов
+        message_lower = text.lower()
+        for word in forbidden_words:
+            if word in message_lower:
+                return True
+        
+        return False
+    
+    except Exception as e:
+        # В случае ошибки (например, проблемы с чтением файла) возвращаем False
+        print(f"Ошибка при чтении файла forbidden_words.txt: {e}")
+        return False
 
 # Остальные функции без изменений
 time_designation = {"s": 1, "m": 60, "h": 3600, "d": 86400}
