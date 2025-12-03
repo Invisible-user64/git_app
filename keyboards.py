@@ -18,3 +18,11 @@ cmds_kb = InlineKeyboardMarkup(
           [InlineKeyboardButton(text=">>", callback_data="to_btns")]
       ]
   )
+
+cmd_start_kb_for_user = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="Мои дела", callback_data="cases"),]
+          ]
+  )
+
+apil_message_button = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Подать апелляцию", url="https://t.me/TheRulerAndTheJudgeBot")]])

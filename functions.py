@@ -5,9 +5,10 @@ import os
 import time 
 import asyncio
 from aiogram import Bot
-from aiogram.types import ChatPermissions
+from aiogram.types import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 
-from config import DB_NAME, GROUP_ID, TOKEN
+from config import DB_NAME, GROUP_ID, TOKEN, LOGGING_GROUP_ID
+from keyboards import apil_message_button
 
 bot = Bot(token=TOKEN)
 
@@ -32,6 +33,16 @@ async def init_db():
                     username TEXT PRIMARY KEY,
                     ban_data TEXT NOT NULL
                 )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS badcases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_id TEXT UNIQUE NOT NULL,
+                    username TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    type TEXT NOT NULL,
+                    moderator TEXT NOT NULL
+                )           
             """)
             # Миграция для blacklist (если столбца ban_data нет)
             try:
@@ -63,10 +74,137 @@ async def init_db():
                 # Переименовываем временную таблицу
                 await conn.execute("ALTER TABLE users_temp RENAME TO users")
                 print("Миграция таблицы users завершена.")
+            # Миграция для badcases: проверяем и добавляем столбец id и type, если их нет
+            try:
+                await conn.execute("SELECT id FROM badcases LIMIT 1")
+            except aiosqlite.OperationalError:
+                print("Выполняем миграцию таблицы badcases...")
+                # Создаём временную таблицу с новой схемой
+                await conn.execute("""
+                    CREATE TABLE badcases_temp (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        case_id TEXT UNIQUE NOT NULL,
+                        username TEXT NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        type TEXT NOT NULL DEFAULT 'unknown',
+                        moderator TEXT NOT NULL
+                    )
+                """)
+                # Копируем существующие данные (id присвоится автоматически, type получит DEFAULT 'unknown')
+                await conn.execute("INSERT INTO badcases_temp (case_id, username, user_id, type, moderator) SELECT case_id, username, user_id, 'unknown', moderator FROM badcases")
+                # Удаляем старую таблицу
+                await conn.execute("DROP TABLE badcases")
+                # Переименовываем временную таблицу
+                await conn.execute("ALTER TABLE badcases_temp RENAME TO badcases")
+                print("Миграция таблицы badcases завершена.")
             await conn.commit()
         print("База данных инициализирована.")
     except Exception as e:
         print(f"Ошибка инициализации БД: {e}")
+
+# Новая функция для добавления кейса в таблицу badcases и отправки сообщения в логи
+async def add_badcase(username: str, user_id: int, moderator: str | None, case_type: str, duration: int = 0, reason: str = "") -> str:
+    """
+    Добавляет кейс в таблицу badcases и отправляет сообщение в группу логов.
+    case_type: 'ban', 'warn', 'mute' и т.д.
+    duration: длительность в секундах (0 для постоянного).
+    reason: причина (по умолчанию 'Не указана').
+    """
+    try:
+        # Генерируем case_id: TKS-YYYYMMDD-NNNN
+        current_date = time.strftime("%Y%m%d")
+        async with aiosqlite.connect(DB_NAME) as conn:
+            # Находим последний порядковый номер для текущей даты
+            cursor = await conn.execute(
+                "SELECT case_id FROM badcases WHERE case_id LIKE ? ORDER BY case_id DESC LIMIT 1",
+                (f"TKS-{current_date}-%",)
+            )
+            result = await cursor.fetchone()
+            if result:
+                last_num = int(result[0].split('-')[-1])
+                next_num = last_num + 1
+            else:
+                next_num = 1
+            case_id = f"TKS-{current_date}-{next_num:04d}"
+            
+            # Вставляем кейс в таблицу
+            await conn.execute(
+                "INSERT INTO badcases (case_id, username, user_id, type, moderator) VALUES (?, ?, ?, ?, ?)",
+                (case_id, username, user_id, case_type.lower(), moderator)
+            )
+            await conn.commit()
+        
+        # Определяем эмодзи для типа кейса
+        emoji_map = {
+            "заглушен": "🔇",
+            "бан": "🔨",
+            "предупреждение": "⚠️"
+        }
+        emoji = emoji_map.get(case_type.lower(), "❓")
+        
+        # Форматируем длительность
+        duration_text = format_time(duration) if duration > 0 else "Постоянно"
+        
+        # Формируем сообщение для логов
+        message = f"{emoji} {case_type.capitalize()} — {case_id}\nПользователь: @{username}\nДлительность: {duration_text}\nПричина: {reason or 'Не указана'}\nМодератор: {moderator or "Неизвестен"}"
+        
+        # Отправляем сообщение в группу логов
+        try:
+            await bot.send_message(chat_id=LOGGING_GROUP_ID, text=message)
+        except Exception as e:
+            print(f"Ошибка отправки сообщения в логи: {e}")
+        
+        print(f"Кейс добавлен: {case_id} для @{username} ({case_type})")
+        return message
+    except Exception as e:
+        print(f"Ошибка добавления кейса: {e}")
+
+# Реализованная функция для сортировки и извлечения кейсов пользователя по username или user_id
+async def sort_users_cases_by_username_or_id(username: str = None, user_id: int = None):
+    """
+    Извлекает и сортирует кейсы из таблицы badcases для конкретного пользователя по username или user_id.
+    Возвращает список словарей с кейсами, отсортированными по case_id в убывающем порядке (последние кейсы первыми).
+    Каждый словарь содержит: id, case_id, username, user_id, type, moderator.
+    """
+    try:
+        async with aiosqlite.connect(DB_NAME) as conn:
+            cursor = await conn.execute(
+                "SELECT id, case_id, username, user_id, type, moderator FROM badcases WHERE (username = ? OR ? IS NULL) AND (user_id = ? OR ? IS NULL) ORDER BY case_id DESC",
+                (username, username, user_id, user_id)
+            )
+            rows = await cursor.fetchall()
+        
+        # Преобразуем в список словарей для удобства
+        cases = [
+            {
+                'id': row[0],
+                'case_id': row[1],
+                'username': row[2],
+                'user_id': row[3],
+                'type': row[4],
+                'moderator': row[5]
+            }
+            for row in rows
+        ]
+        
+        print(f"Найдено {len(cases)} кейсов для @{username} или ID {user_id}")
+        return cases
+    except Exception as e:
+        print(f"Ошибка извлечения кейсов: {e}")
+        return []
+# Новая функция для создания Inline клавиатуры с кнопками case_id
+def create_cases_keyboard(cases: list) -> InlineKeyboardMarkup:
+    """
+    Создаёт Inline клавиатуру на основе списка кейсов.
+    Каждая кнопка имеет текст case_id и callback_data равный case_id.
+    Кнопки располагаются в одну колонку (по одной в ряд).
+    Если кейсов нет, возвращает пустую клавиатуру.
+    """
+    buttons = []
+    for case in cases:
+        button = InlineKeyboardButton(text=case['case_id'], callback_data=case['case_id'])
+        buttons.append([button])  # Каждый в отдельном ряду
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # Функция для загрузки пользователей из SQL таблицы (теперь async)
 async def load_users():
@@ -419,7 +557,7 @@ async def get_user_id_by_username_in_group(username: str) -> int | None:
         return None
 
 # Обновленная функция для бана по ID или username с временем и причиной
-async def ban_user_by_id_or_username(identifier: str, until_date: int = 0, reason: str = "") -> str:
+async def ban_user_by_id_or_username(identifier: str, moderator: str | None, until_date: int = 0, reason: str = "") -> str:
     """
     Забанить пользователя по ID (число) или @username с указанным временем и причиной.
     Возвращает сообщение об успехе или ошибке.
@@ -467,16 +605,22 @@ async def ban_user_by_id_or_username(identifier: str, until_date: int = 0, reaso
             await save_blacklist(blacklist)
             print(f"Пользователь @{username_for_blacklist} добавлен в черный список.")
 
+        moder_username = f"@{moderator}"
+
+        # Добавляем кейс в badcases и отправляем в логи
+        answer = await add_badcase(username_for_blacklist, user_id, moder_username, "бан", until_date, reason)
+
         ban_type = "временно" if until_date > 0 else "постоянно"
         time_text = f" на {format_time(until_date)}" if until_date > 0 else ""
-        reason_text = f" по причине: {reason}" if reason else ""
+        reason_text = f" по причине: {reason}." if reason else ""
+        moderator_text = f"\nМодератор: {moder_username}"
 
         # Отправляем сообщение в чат
-        await bot.send_message(chat_id=GROUP_ID, text=f"Пользователь {identifier} забанен {ban_type}{time_text}{reason_text}.")
+        await bot.send_message(chat_id=GROUP_ID, text=f"{answer}", reply_markup=apil_message_button)
 
         # Отправляем личное сообщение пользователю
         try:
-            await bot.send_message(chat_id=user_id, text=f"Вы забанены {ban_type}{time_text}{reason_text}.")
+            await bot.send_message(chat_id=user_id, text=f"Вы забанены {ban_type}{time_text}{reason_text}{moderator_text}.")
         except Exception as e:
             print(f"Не удалось отправить личное сообщение пользователю {user_id}: {e}")
 
@@ -485,8 +629,7 @@ async def ban_user_by_id_or_username(identifier: str, until_date: int = 0, reaso
         print(f"Ошибка при бане: {e}")
         return f"Ошибка: {str(e)}. Проверьте права бота или ID группы."
 
-# Новая функция для разбана по ID или username
-async def unban_user_by_id_or_username(identifier: str) -> str:
+async def unban_user_by_id_or_username(identifier: str, moderator: str | None) -> str:
     """
     Разбанить пользователя по ID (число) или @username.
     Возвращает сообщение об успехе или ошибке.
@@ -519,7 +662,7 @@ async def unban_user_by_id_or_username(identifier: str) -> str:
 
         # Разбаниваем пользователя
         await bot.unban_chat_member(chat_id=GROUP_ID, user_id=user_id)
-
+        
         # Удаляем из черного списка
         if username_for_blacklist:
             blacklist = await load_blacklist()
@@ -527,9 +670,23 @@ async def unban_user_by_id_or_username(identifier: str) -> str:
                 del blacklist[username_for_blacklist]
                 await save_blacklist(blacklist)
                 print(f"Пользователь @{username_for_blacklist} удален из черного списка.")
+        
+        # Удаляем последний кейс бана для этого пользователя
+        async with aiosqlite.connect(DB_NAME) as conn:
+            await conn.execute(
+                "DELETE FROM badcases WHERE id = (SELECT id FROM badcases WHERE user_id = ? AND type = 'бан' ORDER BY case_id DESC LIMIT 1)",
+                (user_id,)
+            )
+            await conn.commit()
+            print(f"Удалён последний кейс бана для пользователя {identifier} (ID: {user_id})")
+        
+        answer = f"🔓 Снятие бана\nПользователь: {identifier}\nМодератор: {f"@{moderator}" or "Неизвестен"}"
+        
+        # Отправляем сообщение в группу логов
+        await bot.send_message(chat_id=LOGGING_GROUP_ID, text=answer)
 
         # Отправляем сообщение в чат
-        await bot.send_message(chat_id=GROUP_ID, text=f"Пользователь {identifier} разбанен.")
+        await bot.send_message(chat_id=GROUP_ID, text=answer)
 
         # Отправляем личное сообщение пользователю
         try:
@@ -576,7 +733,7 @@ async def check_expired_mutes():
     
 
 # Функция для мута по ID или username с временем и причиной
-async def mute_user_by_id_or_username(identifier: str, until_date: int = 0, reason: str = "") -> str:
+async def mute_user_by_id_or_username(identifier: str, moderator: str | None, until_date: int = 0, reason: str = "") -> str:
     """
     Замутить пользователя по ID (число) или @username с указанным временем и причиной.
     Возвращает сообщение об успехе или ошибке.
@@ -623,16 +780,22 @@ async def mute_user_by_id_or_username(identifier: str, until_date: int = 0, reas
         users[username_for_muted]["muted_reason"] = reason if reason else "Не указана"
         await save_users(users)
 
+        moder_username = f"@{moderator}"
+
+        # Добавляем кейс в badcases и отправляем в логи
+        answer = await add_badcase(username_for_muted, user_id, moder_username, "заглушен", until_date, reason)
+
         mute_type = "временно" if until_date > 0 else "постоянно"
         time_text = f" на {format_time(until_date)}" if until_date > 0 else ""
         reason_text = f" по причине: {reason}" if reason else ""
+        moderator_text = f"\nМодератор: {moder_username}"
 
         # Отправляем сообщение в чат
-        await bot.send_message(chat_id=GROUP_ID, text=f"Пользователь {identifier} заглушён {mute_type}{time_text}{reason_text}.")
+        await bot.send_message(chat_id=GROUP_ID, text=f"{answer}", reply_markup=apil_message_button)
 
         # Отправляем личное сообщение пользователю
         try:
-            await bot.send_message(chat_id=user_id, text=f"Вы заглушены {mute_type}{time_text}{reason_text}.")
+            await bot.send_message(chat_id=user_id, text=f"Вы заглушены {mute_type}{time_text}{reason_text}{moderator_text}.")
         except Exception as e:
             print(f"Не удалось отправить личное сообщение пользователю {user_id}: {e}")
 
@@ -643,7 +806,7 @@ async def mute_user_by_id_or_username(identifier: str, until_date: int = 0, reas
 
 
 # Функция для размута по ID или username
-async def unmute_user_by_id_or_username(identifier: str) -> str:
+async def unmute_user_by_id_or_username(identifier: str, moderator: str | None) -> str:
     """
     Размутить пользователя по ID (число) или @username.
     Возвращает сообщение об успехе или ошибке.
@@ -685,9 +848,23 @@ async def unmute_user_by_id_or_username(identifier: str) -> str:
             users[username_for_muted]["muted_until"] = 0
             users[username_for_muted]["muted_reason"] = ""
             await save_users(users)
+        
+        # Удаляем последний кейс мута для этого пользователя
+        async with aiosqlite.connect(DB_NAME) as conn:
+            await conn.execute(
+                "DELETE FROM badcases WHERE id = (SELECT id FROM badcases WHERE user_id = ? AND type = 'заглушен' ORDER BY case_id DESC LIMIT 1)",
+                (user_id,)
+            )
+            await conn.commit()
+            print(f"Удалён последний кейс мута для пользователя {identifier} (ID: {user_id})")
+        
+        answer = f"🔊 Снятие мута\nПользователь: {identifier}\nМодератор: {f"@{moderator}" or "Неизвестен"}"
+        
+        # Отправляем сообщение в группу логов
+        await bot.send_message(chat_id=LOGGING_GROUP_ID, text=answer)
 
         # Отправляем сообщение в чат
-        await bot.send_message(chat_id=GROUP_ID, text=f"Пользователь {identifier} больше не заглушен.")
+        await bot.send_message(chat_id=GROUP_ID, text=answer)
 
         # Отправляем личное сообщение пользователю
         try:
@@ -722,6 +899,7 @@ async def check_expired_warnings():
                         # Уменьшаем warnings на количество истекших
                         decrement_count = len(expired_columns)
                         new_warnings = max(0, warnings - decrement_count)
+                        
                         await conn.execute(
                             "UPDATE users SET warnings = ?, warning_1_data = CASE WHEN warning_1_data < ? THEN 0 ELSE warning_1_data END, warning_2_data = CASE WHEN warning_2_data < ? THEN 0 ELSE warning_2_data END, warning_3_data = CASE WHEN warning_3_data < ? THEN 0 ELSE warning_3_data END WHERE id = ?",
                             (new_warnings, current_time, current_time, current_time, db_id)
@@ -742,7 +920,7 @@ async def check_expired_warnings():
             await asyncio.sleep(60)  # Ждем перед следующей попыткой
     
 
-async def warn_user_by_id_or_username(identifier: str, until_date: int = 0, reason: str = "") -> str:
+async def warn_user_by_id_or_username(identifier: str, moderator: str | None, until_date: int = 0, reason: str = "") -> str:
     """
     Выдать предупреждение пользователю по ID (число) или @username с указанным временем и причиной.
     Возвращает сообщение об успехе или ошибке.
@@ -806,23 +984,25 @@ async def warn_user_by_id_or_username(identifier: str, until_date: int = 0, reas
             return f"Пользователь {identifier} забанен постоенно и добавлен в черный список." + (f"\nПричина: Правила были нарушены 3 раза.")
 
         else:
-            # Вычисляем until_date
-            warn_until = int(time.time()) + until_date if until_date > 0 else 0
-
-            # Добавляем в список предупреждений,я хз ещё думаем как реализовать
-
+            # Устанавливаем expiry для предупреждения
+            await set_warning_expiry(username=username_for_blacklist, user_id=user_id, expiry_time=until_date)
+            
+            # Добавляем кейс в badcases и отправляем в логи
+            moder_username = f"@{moderator}"
+            answer = await add_badcase(username_for_blacklist, user_id, moder_username, "предупреждение", until_date, reason)
 
             warn_type = "временное" if until_date > 0 else "постоянное"
             time_text = f" на {format_time(until_date)}" if until_date > 0 else ""
             reason_text = f" по причине: {reason}" if reason else ""
+            moderator_text = f"\nМодератор: {moder_username}"
             
 
             # Отправляем сообщение в чат
-            await bot.send_message(chat_id=GROUP_ID, text=f"Пользователю {identifier} было выдано {warn_type} предупреждение{time_text}{reason_text}.\nПредупреждений осталось: {3-warning_count}.")
+            await bot.send_message(chat_id=GROUP_ID, text=answer, reply_markup=apil_message_button)
 
             # Отправляем личное сообщение пользователю
             try:
-                await bot.send_message(chat_id=user_id, text=f"Вам выдано {warn_type} предупреждение{time_text}{reason_text}.\nПредупреждений осталось: {3-warning_count}.")
+                await bot.send_message(chat_id=user_id, text=f"Вам выдано {warn_type} предупреждение{time_text}{reason_text}.\nПредупреждений осталось: {3-warning_count}{moderator_text}.")
             except Exception as e:
                 print(f"Не удалось отправить личное сообщение пользователю {user_id}: {e}")
 
@@ -832,7 +1012,7 @@ async def warn_user_by_id_or_username(identifier: str, until_date: int = 0, reas
         return f"Ошибка: {str(e)}. Проверьте права бота или ID группы."
     
 # Новая функция для разбана по ID или username
-async def unwarn_user_by_id_or_username(identifier: str) -> str:
+async def unwarn_user_by_id_or_username(identifier: str, moderator: str | None) -> str:
     """
     Снять предупреждение с пользователя по ID (число) или @username.
     Возвращает сообщение об успехе или ошибке.
@@ -866,9 +1046,23 @@ async def unwarn_user_by_id_or_username(identifier: str) -> str:
                 return f"Пользователь @{username} не найден в базе данных. Возможно, он не писал сообщения или не добавлен. Попробуйте ввести его ID (число)."
         else:
             return "Неверный формат. Введите ID (число) или @username."
+        
+        # Удаляем последний кейс предупреждения для этого пользователя
+        async with aiosqlite.connect(DB_NAME) as conn:
+            await conn.execute(
+                "DELETE FROM badcases WHERE id = (SELECT id FROM badcases WHERE user_id = ? AND type = 'предупреждение' ORDER BY case_id DESC LIMIT 1)",
+                (user_id,)
+            )
+            await conn.commit()
+            print(f"Удалён последний кейс предупреждения для пользователя {identifier} (ID: {user_id})")
+        
+        answer = f"✅ Снятие предупреждения\nПользователь: {identifier}\nМодератор: {f"@{moderator}" or "Неизвестен"}"
+        
+        # Отправляем сообщение в группу логов
+        await bot.send_message(chat_id=LOGGING_GROUP_ID, text=answer)
 
         # Отправляем сообщение в чат
-        await bot.send_message(chat_id=GROUP_ID, text=f"Пользователю {identifier} сняли 1 предупреждение.")
+        await bot.send_message(chat_id=GROUP_ID, text=answer)
 
         # Отправляем личное сообщение пользователю
         try:
@@ -903,4 +1097,3 @@ def format_time(seconds: int) -> str:
         return f"{seconds // 3600} ч"
     else:
         return f"{seconds // 86400} д"
-    

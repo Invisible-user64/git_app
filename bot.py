@@ -8,20 +8,36 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKe
 from aiogram.fsm.context import FSMContext
 from functions import load_users, save_users, load_blacklist, parse_time, get_user_id_by_username_in_group, init_db, check_expired_bans, check_expired_mutes, check_expired_warnings
 from functions import load_warnings_count, set_warning_expiry, check_forbidden_words, ban_user_by_id_or_username, unban_user_by_id_or_username, mute_user_by_id_or_username, unmute_user_by_id_or_username, warn_user_by_id_or_username, unwarn_user_by_id_or_username
-from keyboards import cmd_start_kb, cmds_kb
+from functions import sort_users_cases_by_username_or_id, create_cases_keyboard
+from keyboards import cmd_start_kb, cmds_kb, cmd_start_kb_for_user
 from FSM import Ban, Unban, Mute, Unmute, Warn, Unwarn
 
-from config import TOKEN, ADMIN_ID, GROUP_ID, DB_NAME
+from config import TOKEN, ADMIN_ID, GROUP_ID, DB_NAME, LOGGING_GROUP_ID
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# Обработчик для добавления пользователей, которые пишут сообщения в группе, если их нет в базе данных
 @dp.message(F.chat.id == GROUP_ID)
-async def moderation(message: Message):
+async def check_user_messages(message: Message):
+    user = message.from_user
+    username = user.username
+    user_id = user.id
+
+    if username:
+        users = await load_users()
+        if username not in users:
+            users[username] = {"id": user_id, "muted_until": 0, "muted_reason": ""}
+        await save_users(users)
+        print(f"Пользователь добавлен по сообщению: @{username} -> {user_id}")
+
     text = message.text
     username = f"@{message.from_user.username}"
-    if check_forbidden_words(text=text):
-        await ban_user_by_id_or_username(identifier=username, until_date=0, reason="Было произнесенно запретное слово")
+    try:
+        if check_forbidden_words(text=text):
+            await ban_user_by_id_or_username(identifier=username, moderator="TheRulerAndTheJudgeBot", until_date=0, reason="Было произнесенно запретное слово")
+    except Exception as e:
+        print(f"Ошибка: {e}")
 
 # Новый обработчик для проверки группы
 #@dp.message(Command("groupinfo"), F.chat.id == GROUP_ID)
@@ -37,7 +53,7 @@ async def cmd_start(message: Message):
     if message.from_user.id in ADMIN_ID:
         await message.answer("Команды:\n/warn\n/unwarn\n/mute\n/unmute\n/ban\n/unban\n/blacklist", reply_markup=cmds_kb)
     else:
-        await message.answer("У вас нет прав доступа!")
+        await message.answer("Главное меню:", reply_markup=cmd_start_kb_for_user)
 
 @dp.message(Command("ban"), F.chat.type == "private")
 async def cmd_ban(message: Message, command: CommandObject):
@@ -50,6 +66,7 @@ async def cmd_ban(message: Message, command: CommandObject):
             return
         
         identifier = None
+        moderator = message.from_user.username
         ban_until_or_reason = None
         reason = None
 
@@ -67,18 +84,18 @@ async def cmd_ban(message: Message, command: CommandObject):
 
         if identifier.startswith("@") or identifier.isdigit():
             if ban_until_or_reason == None and reason == None:
-                result = await ban_user_by_id_or_username(identifier, 0, "")
+                result = await ban_user_by_id_or_username(identifier, moderator, 0, "")
                 await message.answer(result) 
             elif ban_until_or_reason[0].isdigit() and reason == None:
                 until_date = parse_time(ban_until_or_reason)
-                result = await ban_user_by_id_or_username(identifier, until_date, "")
+                result = await ban_user_by_id_or_username(identifier, moderator, until_date, "")
                 await message.answer(result)
             elif not ban_until_or_reason[0].isdigit() and reason == None:
-                result = await ban_user_by_id_or_username(identifier, 0, ban_until_or_reason)
+                result = await ban_user_by_id_or_username(identifier, moderator, 0, ban_until_or_reason)
                 await message.answer(result)
             else:
                 until_date = parse_time(ban_until_or_reason)
-                result = await ban_user_by_id_or_username(identifier, until_date, reason)
+                result = await ban_user_by_id_or_username(identifier, moderator, until_date, reason)
                 await message.answer(result)     
         else:
             await message.answer("Вы не указали корректный username или ID")
@@ -94,7 +111,8 @@ async def cmd_unban(message: Message, command: CommandObject):
             return
         
         if identifier.startswith("@") or identifier.isdigit():
-            result = await unban_user_by_id_or_username(identifier)
+            moderator = message.from_user.username
+            result = await unban_user_by_id_or_username(identifier, moderator)
             await message.answer(result)     
         else:
             await message.answer("Вы не указали корректный username или ID")
@@ -111,6 +129,7 @@ async def cmd_mute(message: Message, command: CommandObject):
             return
         
         identifier = None
+        moderator = message.from_user.username
         mute_until_or_reason = None
         reason = None
 
@@ -128,18 +147,18 @@ async def cmd_mute(message: Message, command: CommandObject):
 
         if identifier.startswith("@") or identifier.isdigit():
             if mute_until_or_reason == None and reason == None:
-                result = await mute_user_by_id_or_username(identifier, 0, "")
+                result = await mute_user_by_id_or_username(identifier, moderator, 0, "")
                 await message.answer(result) 
             elif mute_until_or_reason[0].isdigit() and reason == None:
                 until_date = parse_time(mute_until_or_reason)
-                result = await mute_user_by_id_or_username(identifier, until_date, "")
+                result = await mute_user_by_id_or_username(identifier, moderator, until_date, "")
                 await message.answer(result)
             elif not mute_until_or_reason[0].isdigit() and reason == None:
-                result = await mute_user_by_id_or_username(identifier, 0, mute_until_or_reason)
+                result = await mute_user_by_id_or_username(identifier, moderator, 0, mute_until_or_reason)
                 await message.answer(result)
             else:
                 until_date = parse_time(mute_until_or_reason)
-                result = await mute_user_by_id_or_username(identifier, until_date, reason)
+                result = await mute_user_by_id_or_username(identifier, moderator, until_date, reason)
                 await message.answer(result)     
         else:
             await message.answer("Вы не указали корректный username или ID")
@@ -155,7 +174,8 @@ async def cmd_unmute(message: Message, command: CommandObject):
             return
         
         if identifier.startswith("@") or identifier.isdigit():
-            result = await unmute_user_by_id_or_username(identifier)
+            moderator = message.from_user.username
+            result = await unmute_user_by_id_or_username(identifier, moderator)
             await message.answer(result)     
         else:
             await message.answer("Вы не указали корректный username или ID")
@@ -171,6 +191,7 @@ async def cmd_warn(message: Message, command: CommandObject):
             return
         
         identifier = None
+        moderator = message.from_user.username
         warn_until_or_reason = None
         reason = None
 
@@ -188,22 +209,22 @@ async def cmd_warn(message: Message, command: CommandObject):
 
         if identifier.startswith("@") or identifier.isdigit():
             if warn_until_or_reason == None and reason == None:
-                result = await warn_user_by_id_or_username(identifier, 0, "")
+                result = await warn_user_by_id_or_username(identifier, moderator, 0, "")
                 await message.answer(result) 
             elif warn_until_or_reason[0].isdigit() and reason == None:
                 until_date = parse_time(warn_until_or_reason)
-                result = await warn_user_by_id_or_username(identifier, until_date, "")
+                result = await warn_user_by_id_or_username(identifier, moderator, until_date, "")
                 if identifier.startswith("@"):
                     await set_warning_expiry(username=identifier[1:], expiry_time=until_date)
                 else:
                     await set_warning_expiry(user_id=identifier, expiry_time=until_date)
                 await message.answer(result)
             elif not warn_until_or_reason[0].isdigit() and reason == None:
-                result = await warn_user_by_id_or_username(identifier, 0, warn_until_or_reason)
+                result = await warn_user_by_id_or_username(identifier, moderator, 0, warn_until_or_reason)
                 await message.answer(result)
             else:
                 until_date = parse_time(warn_until_or_reason)
-                result = await warn_user_by_id_or_username(identifier, until_date, reason)
+                result = await warn_user_by_id_or_username(identifier, moderator, until_date, reason)
                 if identifier.startswith("@"):
                     await set_warning_expiry(username=identifier[1:], expiry_time=until_date)
                 else:
@@ -223,10 +244,28 @@ async def cmd_unwarn(message: Message, command: CommandObject):
             return
         
         if identifier.startswith("@") or identifier.isdigit():
-            result = await unwarn_user_by_id_or_username(identifier)
+            moderator = message.from_user.username
+            result = await unwarn_user_by_id_or_username(identifier, moderator)
             await message.answer(result)     
         else:
             await message.answer("Вы не указали корректный username или ID")
+
+@dp.message(Command("blacklist"))
+async def cmd_blacklist(message: Message):
+    blacklist = await load_blacklist()
+    if not blacklist:
+        await message.answer("Черный список пуст.")
+    else:
+        text = "Черный список:\n"
+        for uname, data in blacklist.items():
+            until = data.get("until", 0)
+            reason = data.get("reason", "Не указана")
+            if until > 0:
+                until_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
+                text += f"@{uname} (ID: {data['id']}) - до {until_str}, причина: {reason}\n"
+            else:
+                text += f"@{uname} (ID: {data['id']}) - постоянный, причина: {reason}\n"
+        await message.answer(text)
 
 @dp.callback_query(F.data == "to_cmds")
 async def to_commands(callback: CallbackQuery):
@@ -276,9 +315,10 @@ async def process_ban_reason(message: Message, state: FSMContext):
     reason = message.text.strip()
     data = await state.get_data()
     identifier = data.get("identifier")
+    moderator = message.from_user.username
     until_seconds = data.get("until_seconds", 0)
 
-    result = await ban_user_by_id_or_username(identifier, until_seconds, reason)
+    result = await ban_user_by_id_or_username(identifier, moderator, until_seconds, reason)
     await message.answer(result)
 
     await state.clear()
@@ -287,9 +327,10 @@ async def process_ban_reason(message: Message, state: FSMContext):
 async def skip_reason(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     identifier = data.get("identifier")
+    moderator = callback.from_user.username
     until_seconds = data.get("until_seconds", 0)
 
-    result = await ban_user_by_id_or_username(identifier, until_seconds, "")
+    result = await ban_user_by_id_or_username(identifier, moderator, until_seconds, "")
     await callback.message.edit_text(result)
 
     await state.clear()
@@ -302,8 +343,9 @@ async def unban_func(callback: CallbackQuery, state: FSMContext):
 @dp.message(Unban.waiting_for_message)
 async def process_unban(message: Message, state: FSMContext):
     identifier = message.text.strip()
+    moderator = message.from_user.username
 
-    result = await unban_user_by_id_or_username(identifier)
+    result = await unban_user_by_id_or_username(identifier, moderator)
     await message.answer(result)
 
     await state.clear()
@@ -348,20 +390,22 @@ async def process_mute_reason(message: Message, state: FSMContext):
     reason = message.text.strip()
     data = await state.get_data()
     identifier = data.get("identifier")
+    moderator = message.from_user.username
     until_seconds = data.get("until_seconds", 0)
 
-    result = await mute_user_by_id_or_username(identifier, until_seconds, reason)
+    result = await mute_user_by_id_or_username(identifier, moderator, until_seconds, reason)
     await message.answer(result)
 
     await state.clear()
 
 @dp.callback_query(F.data == "skip_mute_reason", Mute.waiting_for_reason)
-async def skip_reason(callback: CallbackQuery, state: FSMContext):
+async def skip_mute_reason(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     identifier = data.get("identifier")
+    moderator = callback.from_user.username
     until_seconds = data.get("until_seconds", 0)
 
-    result = await mute_user_by_id_or_username(identifier, until_seconds, "")
+    result = await mute_user_by_id_or_username(identifier, moderator, until_seconds, "")
     await callback.message.edit_text(result)
 
     await state.clear()
@@ -374,8 +418,9 @@ async def unmute_func(callback: CallbackQuery, state: FSMContext):
 @dp.message(Unmute.waiting_for_message)
 async def process_unmute(message: Message, state: FSMContext):
     identifier = message.text.strip()
+    moderator = message.from_user.username
 
-    result = await unmute_user_by_id_or_username(identifier)
+    result = await unmute_user_by_id_or_username(identifier, moderator)
     await message.answer(result)
 
     await state.clear()
@@ -421,6 +466,7 @@ async def process_warn_reason(message: Message, state: FSMContext):
     reason = message.text.strip()
     data = await state.get_data()
     identifier = data.get("identifier")
+    moderator = message.from_user.username
     until_seconds = data.get("until_seconds", 0)
     
     user_id = None
@@ -447,7 +493,7 @@ async def process_warn_reason(message: Message, state: FSMContext):
     elif identifier.isdigit():
         user_id = int(identifier)
     
-    result = await warn_user_by_id_or_username(identifier, until_seconds, reason)
+    result = await warn_user_by_id_or_username(identifier, moderator, until_seconds, reason)
     await message.answer(result)
     
     # Теперь user_id известен, вызываем set_warning_expiry
@@ -456,9 +502,10 @@ async def process_warn_reason(message: Message, state: FSMContext):
     await state.clear()
 
 @dp.callback_query(F.data == "skip_warn_reason", Warn.waiting_for_reason)
-async def skip_reason(callback: CallbackQuery, state: FSMContext):
+async def skip_warn_reason(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     identifier = data.get("identifier")
+    moderator = callback.from_user.username
     until_seconds = data.get("until_seconds", 0)
     
     user_id = None
@@ -485,7 +532,7 @@ async def skip_reason(callback: CallbackQuery, state: FSMContext):
     elif identifier.isdigit():
         user_id = int(identifier)
     
-    result = await warn_user_by_id_or_username(identifier, until_seconds, "")
+    result = await warn_user_by_id_or_username(identifier, moderator, until_seconds, "")
     await callback.message.edit_text(result)
     
     # Теперь user_id известен, вызываем set_warning_expiry
@@ -502,6 +549,7 @@ async def unwarn_func(callback: CallbackQuery, state: FSMContext):
 @dp.message(Unwarn.waiting_for_message)
 async def process_unmute(message: Message, state: FSMContext):
     identifier = message.text.strip()
+    moderator = message.from_user.username
     username = identifier[1:]
     warning_count = await load_warnings_count(username=username)
     print(warning_count, username)
@@ -510,7 +558,7 @@ async def process_unmute(message: Message, state: FSMContext):
         await message.answer("У этого пользователя нет предупреждений")
     
     else:
-        result = await unwarn_user_by_id_or_username(identifier)
+        result = await unwarn_user_by_id_or_username(identifier, moderator)
         await message.answer(result)
 
         await state.clear()
@@ -533,6 +581,26 @@ async def show_blacklist(callback: CallbackQuery):
                 text += f"@{uname} (ID: {data['id']}) - постоянный, причина: {reason}\n"
         await callback.message.answer(text)
 
+@dp.callback_query(F.data == "cases")
+async def check_user_cases(callback: CallbackQuery):
+    username = callback.from_user.username
+    user_id = callback.from_user.id
+    # Убираем @ из username, если он есть, для корректного поиска в БД
+    if username and username.startswith('@'):
+        username = username[1:]
+    if username:
+        cases = await sort_users_cases_by_username_or_id(username=username)
+        kb = create_cases_keyboard(cases=cases)
+    else:
+        cases = await sort_users_cases_by_username_or_id(user_id=user_id)
+        kb = create_cases_keyboard(cases=cases)
+    
+    if cases:
+        await callback.message.answer("Ваши дела:", reply_markup=kb)
+    else:
+        await callback.message.answer("У вас нет дел.")
+
+
 # Обработчик для отслеживания новых участников в группе
 @dp.chat_member(F.chat.id == GROUP_ID)
 async def track_new_member(update: ChatMemberUpdated):
@@ -552,20 +620,6 @@ async def track_new_member(update: ChatMemberUpdated):
             print(f"Новый пользователь сохранен: @{username} -> {user_id}")
         else:
             print(f"Пользователь {user_id} без username — не сохранен.")
-
-# Обработчик для добавления пользователей, которые пишут сообщения в группе, если их нет в базе данных
-@dp.message(F.chat.id == GROUP_ID)
-async def add_user_on_message(message: Message):
-    user = message.from_user
-    username = user.username
-    user_id = user.id
-
-    if username:
-        users = await load_users()
-        if username not in users:
-            users[username] = {"id": user_id, "muted_until": 0, "muted_reason": ""}
-        await save_users(users)
-        print(f"Пользователь добавлен по сообщению: @{username} -> {user_id}")
 
 
 async def main():
